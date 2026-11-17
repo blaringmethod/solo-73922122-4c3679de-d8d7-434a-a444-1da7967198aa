@@ -29,6 +29,8 @@ services:
       OAI_CONNECT_TIMEOUT: "10"
       HARVEST_MAX_ATTEMPTS: "3"
       HARVEST_RETRY_BACKOFF_MS: "300"
+      SQLITE_BUSY_TIMEOUT_MS: "250"
+      HARVEST_RESTART_WAIT_SECONDS: "5"
     volumes:
       - harvester-data:/data
     ports:

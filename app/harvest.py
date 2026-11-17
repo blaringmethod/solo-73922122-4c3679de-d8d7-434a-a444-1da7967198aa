@@ -19,12 +19,20 @@ Contract implemented here:
   waited for; the task's late response can neither publish nor touch another
   round's state because every write is keyed by ``run_id`` and the commit checks
   that this run is still the active one.
+* Cancelling is *accepted* in memory first (tombstone + task cancellation) and
+  persisted to SQLite best-effort.  If another connection holds the write
+  lock, a background finaliser keeps retrying until the ``cancelled`` /
+  ``failed`` state and the staging cleanup are durable — only then is the
+  round reported as finished and a new round allowed to start.  The lock is
+  never waited out on the event loop and lock errors are never swallowed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -36,7 +44,9 @@ from .oai import (
     OaiPage,
     parse_datestamp,
 )
-from .store import Store
+from .store import Store, is_lock_contention
+
+logger = logging.getLogger("harvester")
 
 
 class HarvestCancelled(Exception):
@@ -80,6 +90,7 @@ class RunControl:
     cancel_reason: str | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: str | None = None
+    finalize_scheduled: bool = False
 
     def request_cancel(self, reason: str, source: str) -> None:
         if self.cancel_requested:
@@ -105,11 +116,14 @@ class Harvester:
         config: HarvestConfig,
         *,
         client_factory: Callable[[], Any] | None = None,
+        finalize_retry_interval: float = 0.25,
     ) -> None:
         self.store = store
         self.config = config
         self._client_factory = client_factory or self._default_client
+        self._finalize_retry_interval = finalize_retry_interval
         self._controls: dict[str, RunControl] = {}
+        self._finalizers: set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
 
     def _default_client(self) -> OaiClient:
@@ -139,47 +153,134 @@ class Harvester:
     def _on_task_done(self, control: RunControl, task: asyncio.Task) -> None:
         """Belt-and-braces finalisation.
 
-        ``_run`` normally resolves the control itself.  The one path it cannot
-        cover is a task cancelled before its first step ever executed.  This
-        callback guarantees that such a run is still marked cancelled, never
-        left as ``running`` and never able to publish.
+        ``_run`` schedules exactly one finaliser for every non-successful
+        outcome.  The one path it cannot cover is a task cancelled before
+        its first step ever executed.  This callback guarantees that such a
+        run is still finalised in the database (retried through lock
+        contention), never left as ``running`` and never able to publish.
         """
-        if control.done.is_set():
+        if control.finalize_scheduled or control.done.is_set():
             return
         try:
             if task.cancelled():
-                self.store.finish_cancelled(
-                    control.run_id,
-                    control.cancel_reason or "采集任务在开始前被取消",
-                )
-                control.resolve("cancelled")
+                outcome = "cancelled"
+                message = control.cancel_reason or "采集任务在开始前被取消"
             else:
                 exc = task.exception()
-                if exc is not None:
-                    self.store.finish_failed(
-                        control.run_id, f"采集异常: {exc!r}"
-                    )
-                control.resolve("failed")
+                outcome = "failed"
+                message = (
+                    f"采集异常: {exc!r}" if exc is not None else "采集任务异常结束"
+                )
         except Exception:
-            control.resolve("failed")
+            outcome, message = "failed", "采集任务异常结束"
+        self._schedule_finalize(control.run_id, outcome, message, control)
+
+    # ---------------------------------------------------------- finalisation
+    def _schedule_finalize(
+        self,
+        run_id: str,
+        outcome: str,
+        message: str,
+        control: RunControl | None = None,
+    ) -> None:
+        """Run the durable finalisation of a round in the background.
+
+        The finaliser retries through ``database is locked`` contention
+        until the state (and the staging cleanup) is actually committed;
+        ``control.done`` is only set afterwards, which is what allows a new
+        round to start.  Non-lock errors are logged and left to the
+        startup recovery instead of being retried forever.
+        """
+        if control is not None:
+            if control.finalize_scheduled:
+                return
+            control.finalize_scheduled = True
+        task = asyncio.create_task(
+            self._finalize_loop(run_id, outcome, message, control),
+            name=f"finalize-{run_id}",
+        )
+        self._finalizers.add(task)
+        task.add_done_callback(self._finalizers.discard)
+
+    async def _finalize_loop(
+        self,
+        run_id: str,
+        outcome: str,
+        message: str,
+        control: RunControl | None,
+    ) -> None:
+        attempts = 0
+        try:
+            while True:
+                try:
+                    if outcome == "cancelled":
+                        await asyncio.to_thread(
+                            self.store.finish_cancelled, run_id, message
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self.store.finish_failed, run_id, message
+                        )
+                    if attempts:
+                        logger.info(
+                            "轮次 %s 的%s收尾在外部写锁释放后已落库（重试 %d 次）",
+                            run_id,
+                            "取消" if outcome == "cancelled" else "失败",
+                            attempts,
+                        )
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not is_lock_contention(exc):
+                        logger.error(
+                            "轮次 %s 收尾落库失败（非锁错误，不再重试，"
+                            "将在下次启动时恢复）: %r",
+                            run_id,
+                            exc,
+                        )
+                        break
+                    attempts += 1
+                    if attempts == 1 or attempts % 40 == 0:
+                        logger.info(
+                            "数据库被外部写锁占用，轮次 %s 的收尾将在后台重试"
+                            "（第 %d 次）",
+                            run_id,
+                            attempts,
+                        )
+                    await asyncio.sleep(self._finalize_retry_interval)
+        finally:
+            if control is not None:
+                control.resolve(outcome)
 
     async def cancel_run(
         self, run_id: str, reason: str = "用户取消", source: str = "user"
-    ) -> bool:
-        """Cancel without waiting for an in-flight page.
+    ) -> str:
+        """Accept a cancel without waiting for an in-flight page or lock.
 
-        The run is marked cancelled in SQLite immediately (a fast local write),
-        which closes the commit path for it.  The asyncio task is then
-        cancelled so the HTTP read is abandoned now; its eventual unwinding is
-        harmless.
+        The in-memory tombstone and the task cancellation take effect at
+        once, so the round can neither keep harvesting nor publish from
+        this moment on.  Persisting ``cancelled`` is attempted right away;
+        if another connection holds the write lock, a background finaliser
+        retries until the state and the staging cleanup are durable.
+
+        Returns ``"cancelled"`` when the cancellation is already durable,
+        ``"cancelling"`` when finalisation is still pending.
         """
         control = self._controls.get(run_id)
-        marked = self.store.cancel_run(run_id, reason)
         if control is not None:
             control.request_cancel(reason, source)
-            if control.task is not None and not control.task.done():
-                control.task.cancel()
-        return marked
+        try:
+            await asyncio.to_thread(self.store.cancel_run, run_id, reason)
+            persisted = True
+        except sqlite3.OperationalError as exc:
+            if not is_lock_contention(exc):
+                raise
+            persisted = False
+        if control is not None and control.task is not None and not control.task.done():
+            control.task.cancel()
+        if not persisted:
+            self._schedule_finalize(run_id, "cancelled", reason, control)
+            return "cancelling"
+        return "cancelled"
 
     def control(self, run_id: str) -> RunControl | None:
         return self._controls.get(run_id)
@@ -188,7 +289,17 @@ class Harvester:
         controls = list(self._controls.values())
         for control in controls:
             control.request_cancel("服务停止", "shutdown")
-            self.store.cancel_run(control.run_id, "服务停止")
+            try:
+                self.store.cancel_run(control.run_id, "服务停止")
+            except sqlite3.OperationalError as exc:
+                if is_lock_contention(exc):
+                    self._schedule_finalize(
+                        control.run_id, "cancelled", "服务停止", control
+                    )
+                else:
+                    logger.error(
+                        "停止时取消轮次 %s 落库失败: %r", control.run_id, exc
+                    )
             if control.task is not None and not control.task.done():
                 control.task.cancel()
         for control in controls:
@@ -197,33 +308,54 @@ class Harvester:
                     await control.task
                 except (asyncio.CancelledError, Exception):
                     pass
+        if self._finalizers:
+            # Bound the wait: a finaliser blocked by an external lock that
+            # never releases must not hold the process hostage; the startup
+            # recovery finalises such rounds on the next boot.
+            _, pending = await asyncio.wait(set(self._finalizers), timeout=5.0)
+            if pending:
+                logger.warning(
+                    "关闭时仍有 %d 个轮次收尾未落库，将在下次启动时恢复",
+                    len(pending),
+                )
 
     def _check_cancelled(self, control: RunControl) -> None:
-        if control.cancel_requested or not self.store.is_run_running(control.run_id):
+        if (
+            control.cancel_requested
+            or self.store.cancel_pending(control.run_id)
+            or not self.store.is_run_running(control.run_id)
+        ):
             raise HarvestCancelled(control.cancel_reason or "本轮已取消")
 
     async def _run(self, control: RunControl) -> None:
         run_id = control.run_id
         try:
-            await self._harvest(control)
-            control.resolve("succeeded")
-        except asyncio.CancelledError:
-            # cancel_run() has already persisted 'cancelled'; if the task was
-            # cancelled for another reason (e.g. event loop shutdown), make
-            # sure the run does not stay 'running'.
-            self.store.finish_cancelled(
-                run_id, control.cancel_reason or "采集任务被中断"
-            )
-            control.resolve("cancelled")
-        except HarvestCancelled as exc:
-            self.store.finish_cancelled(run_id, str(exc))
-            control.resolve("cancelled")
-        except HarvestFailed as exc:
-            self.store.finish_failed(run_id, str(exc))
-            control.resolve("failed")
-        except Exception as exc:  # unexpected bug or I/O error
-            self.store.finish_failed(run_id, f"采集异常: {exc!r}")
-            control.resolve("failed")
+            try:
+                await self._harvest(control)
+                control.resolve("succeeded")
+                return
+            except asyncio.CancelledError:
+                # cancel_run() normally persists 'cancelled' itself (or has a
+                # finaliser retrying); a task cancelled for another reason
+                # (e.g. event loop shutdown) is finalised here as well.
+                outcome = "cancelled"
+                message = control.cancel_reason or "采集任务被中断"
+            except HarvestCancelled as exc:
+                outcome, message = "cancelled", str(exc)
+            except HarvestFailed as exc:
+                if control.cancel_requested:
+                    outcome = "cancelled"
+                    message = control.cancel_reason or str(exc)
+                else:
+                    outcome, message = "failed", str(exc)
+            except Exception as exc:  # unexpected bug or I/O error
+                if control.cancel_requested:
+                    outcome = "cancelled"
+                    message = control.cancel_reason or "本轮已取消"
+                else:
+                    outcome, message = "failed", f"采集异常: {exc!r}"
+                    logger.exception("采集轮次 %s 异常结束", run_id)
+            self._schedule_finalize(run_id, outcome, message, control)
         finally:
             async with self._lock:
                 if len(self._controls) > 50:
@@ -343,7 +475,11 @@ class Harvester:
             )
             result = store.commit_run(run_id)
             if not result.get("committed"):
-                if not store.is_run_running(run_id):
+                if (
+                    control.cancel_requested
+                    or store.cancel_pending(run_id)
+                    or not store.is_run_running(run_id)
+                ):
                     raise HarvestCancelled(
                         control.cancel_reason or "本轮在提交前被取消"
                     )

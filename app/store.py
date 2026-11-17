@@ -5,6 +5,30 @@ database.  A harvest round writes into ``run_records`` (a per-run staging
 area) and only the final commit transaction copies staging into ``catalog``
 and advances the watermark.  This is what makes a failed or interrupted
 round a no-op for readers of the published catalogue.
+
+Connection layout
+-----------------
+The store keeps *two* connections:
+
+* ``_conn`` — the only writer.  All mutations are serialised through
+  ``_wlock`` and run with a short ``busy_timeout`` so that an external
+  writer (another SQLite connection holding the write lock) makes them
+  fail fast instead of freezing the whole process for seconds.  Lock
+  failures are surfaced to the caller; the orchestration layer retries
+  finalisation in the background until the lock is released.
+* ``_read`` — a query-only connection for catalogue/progress reads.  In
+  WAL mode readers never wait for a writer, so the web UI stays usable
+  while another connection holds the write lock.
+
+Cancellation tombstones
+-----------------------
+``mark_cancelled`` records a run id in memory *before* any database write
+is attempted.  Every run-scoped write (staging, progress updates, commit)
+checks the tombstone first, so once a cancel is accepted the round can
+neither keep harvesting nor publish — even while the database itself is
+still locked and the ``cancelled`` state cannot be persisted yet.  The
+tombstone is what makes "cancel accepted" immediately effective; the
+database row is made durable afterwards (and retried until it lands).
 """
 
 from __future__ import annotations
@@ -16,6 +40,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+DEFAULT_BUSY_TIMEOUT_MS = 250
+
+_SQLITE_BUSY = getattr(sqlite3, "SQLITE_BUSY", 5)
+_SQLITE_LOCKED = getattr(sqlite3, "SQLITE_LOCKED", 6)
+
+
+def is_lock_contention(exc: BaseException) -> bool:
+    """True when *exc* is SQLite reporting another connection's write lock.
+
+    Only ``SQLITE_BUSY`` / ``SQLITE_LOCKED`` count; other operational
+    errors (disk full, I/O error) must not be retried silently.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in (_SQLITE_BUSY, _SQLITE_LOCKED):
+        return True
+    return "locked" in str(exc).lower()
+
 
 def utc_now_millis() -> str:
     return (
@@ -26,10 +69,15 @@ def utc_now_millis() -> str:
 
 
 class Store:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self, db_path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS
+    ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
+        self._wlock = threading.RLock()
+        self._rlock = threading.RLock()
+        self._tomb_lock = threading.Lock()
+        self._cancelled: set[str] = set()
         self._conn = sqlite3.connect(
             str(self.db_path), check_same_thread=False, isolation_level=None
         )
@@ -37,14 +85,20 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        self._read = sqlite3.connect(
+            str(self.db_path), check_same_thread=False, isolation_level=None
+        )
+        self._read.row_factory = sqlite3.Row
+        self._read.execute("PRAGMA query_only=ON")
+        self._read.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self._init_schema()
         self._recover_interrupted_runs()
         self._ensure_invariants()
 
     # ------------------------------------------------------------------ schema
     def _init_schema(self) -> None:
-        with self._lock:
+        with self._wlock:
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS meta (
@@ -110,7 +164,7 @@ class Store:
 
     def _recover_interrupted_runs(self) -> None:
         """A previous process died.  No in-memory task can own these runs."""
-        with self._lock:
+        with self._wlock:
             now = utc_now_millis()
             rows = self._conn.execute(
                 "SELECT id FROM runs WHERE status = 'running'"
@@ -143,7 +197,7 @@ class Store:
         Created after recovery so a legacy database with stray ``running``
         rows cannot make startup fail.
         """
-        with self._lock:
+        with self._wlock:
             self._conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active
@@ -151,11 +205,31 @@ class Store:
                 """
             )
 
+    # ------------------------------------------------------ cancel tombstones
+    def mark_cancelled(self, run_id: str) -> None:
+        """In-memory tombstone: this run may no longer write or publish.
+
+        Recorded before any database write so that an accepted cancel is
+        effective even while the database is locked by another connection.
+        """
+        with self._tomb_lock:
+            self._cancelled.add(run_id)
+
+    def cancel_pending(self, run_id: str) -> bool:
+        with self._tomb_lock:
+            return run_id in self._cancelled
+
     # ----------------------------------------------------------------- helpers
-    def _meta_get(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key = ?", (key,)
-        ).fetchone()
+    def _meta_get(self, key: str, *, conn: sqlite3.Connection | None = None) -> str | None:
+        if conn is not None:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        else:
+            with self._rlock:
+                row = self._read.execute(
+                    "SELECT value FROM meta WHERE key = ?", (key,)
+                ).fetchone()
         return row["value"] if row else None
 
     def _meta_set(self, key: str, value: str | None) -> None:
@@ -170,9 +244,17 @@ class Store:
                 (key, value),
             )
 
+    def _is_run_running_tx(self, run_id: str) -> bool:
+        """Run-state check on the write connection, inside its transaction."""
+        row = self._conn.execute(
+            "SELECT 1 FROM runs WHERE id = ? AND status = 'running'",
+            (run_id,),
+        ).fetchone()
+        return row is not None
+
     # -------------------------------------------------------------------- runs
     def create_run(self) -> dict[str, Any]:
-        with self._lock:
+        with self._wlock:
             run_id = uuid.uuid4().hex
             now = utc_now_millis()
             state = self._conn.execute(
@@ -202,14 +284,14 @@ class Store:
             return run
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._rlock:
+            row = self._read.execute(
                 "SELECT * FROM runs WHERE id = ?", (run_id,)
             ).fetchone()
             if row is None:
                 return None
             run = dict(row)
-            staged = self._conn.execute(
+            staged = self._read.execute(
                 "SELECT COUNT(*) AS n FROM run_records WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
@@ -217,13 +299,13 @@ class Store:
             return run
 
     def get_active_run(self) -> dict[str, Any] | None:
-        with self._lock:
+        with self._rlock:
             run_id = self._meta_get("active_run_id")
             if run_id:
                 run = self.get_run(run_id)
                 if run and run["status"] == "running":
                     return run
-            row = self._conn.execute(
+            row = self._read.execute(
                 """
                 SELECT * FROM runs WHERE status = 'running'
                  ORDER BY started_at DESC LIMIT 1
@@ -232,22 +314,24 @@ class Store:
             return self.get_run(row["id"]) if row else None
 
     def list_runs(self, limit: int = 15) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._rlock:
+            rows = self._read.execute(
                 "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
 
     def is_run_running(self, run_id: str) -> bool:
-        with self._lock:
-            row = self._conn.execute(
+        with self._rlock:
+            row = self._read.execute(
                 "SELECT 1 FROM runs WHERE id = ? AND status = 'running'",
                 (run_id,),
             ).fetchone()
             return row is not None
 
     def set_window(self, run_id: str, until: str) -> bool:
-        with self._lock:
+        if self.cancel_pending(run_id):
+            return False
+        with self._wlock:
             cur = self._conn.execute(
                 """
                 UPDATE runs SET window_until = ?, phase = 'fetching'
@@ -268,7 +352,9 @@ class Store:
         complete_list_size: int | None,
         phase: str | None = None,
     ) -> bool:
-        with self._lock:
+        if self.cancel_pending(run_id):
+            return False
+        with self._wlock:
             if phase is None:
                 cur = self._conn.execute(
                     """
@@ -314,7 +400,9 @@ class Store:
             return cur.rowcount > 0
 
     def set_last_error(self, run_id: str, message: str) -> None:
-        with self._lock:
+        if self.cancel_pending(run_id):
+            return
+        with self._wlock:
             self._conn.execute(
                 """
                 UPDATE runs SET last_error = ?
@@ -324,8 +412,13 @@ class Store:
             )
 
     def finish_cancelled(self, run_id: str, reason: str) -> bool:
-        """Finalise a cancelled run; safe to call twice."""
-        with self._lock:
+        """Finalise a cancelled run; safe to call twice.
+
+        May raise :class:`sqlite3.OperationalError` on lock contention —
+        the caller (background finaliser) is expected to retry.
+        """
+        self.mark_cancelled(run_id)
+        with self._wlock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
@@ -350,8 +443,12 @@ class Store:
                 raise
 
     def finish_failed(self, run_id: str, error: str) -> bool:
-        """Finalise a failed run.  Staging is discarded, published data not touched."""
-        with self._lock:
+        """Finalise a failed run.  Staging is discarded, published data not touched.
+
+        May raise :class:`sqlite3.OperationalError` on lock contention —
+        the caller (background finaliser) is expected to retry.
+        """
+        with self._wlock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
@@ -377,8 +474,10 @@ class Store:
 
     def reset_stage(self, run_id: str) -> bool:
         """Discard all pages collected for the current attempt."""
-        with self._lock:
-            if not self.is_run_running(run_id):
+        if self.cancel_pending(run_id):
+            return False
+        with self._wlock:
+            if not self._is_run_running_tx(run_id):
                 return False
             self._conn.execute(
                 "DELETE FROM run_records WHERE run_id = ?", (run_id,)
@@ -392,12 +491,15 @@ class Store:
 
         If the same identifier occurs again (whether because of a malformed
         source or a repeated page), the record with the newer OAI datestamp
-        wins; the later observation wins a tie.
+        wins; the later observation wins a tie.  Returns 0 when the round
+        was cancelled (tombstoned) or is no longer running.
         """
-        with self._lock:
+        if self.cancel_pending(run_id):
+            return 0
+        with self._wlock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                if not self.is_run_running(run_id):
+                if self.cancel_pending(run_id) or not self._is_run_running_tx(run_id):
                     self._conn.execute("ROLLBACK")
                     return 0
                 for offset, record in enumerate(records):
@@ -438,24 +540,30 @@ class Store:
         self._conn.execute("DELETE FROM run_records WHERE run_id = ?", (run_id,))
 
     def _clear_active_if(self, run_id: str) -> None:
-        if self._meta_get("active_run_id") == run_id:
+        if self._meta_get("active_run_id", conn=self._conn) == run_id:
             self._meta_set("active_run_id", None)
 
     def commit_run(self, run_id: str) -> dict[str, Any]:
         """Atomically publish staging and advance the watermark.
 
         The check for ownership (``active_run_id``) happens inside the same
-        IMMEDIATE transaction as the catalogue writes.  A cancelled or
-        superseded round can therefore never publish, even if its HTTP
-        response arrives late.
+        IMMEDIATE transaction as the catalogue writes, and the in-memory
+        cancel tombstone is consulted as well.  A cancelled or superseded
+        round can therefore never publish, even if its HTTP response
+        arrives late or the cancellation has not been persisted yet.
         """
-        with self._lock:
+        if self.cancel_pending(run_id):
+            return {"committed": False, "reason": "run was cancelled"}
+        with self._wlock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if self.cancel_pending(run_id):
+                    self._conn.execute("ROLLBACK")
+                    return {"committed": False, "reason": "run was cancelled"}
                 run = self._conn.execute(
                     "SELECT * FROM runs WHERE id = ?", (run_id,)
                 ).fetchone()
-                active = self._meta_get("active_run_id")
+                active = self._meta_get("active_run_id", conn=self._conn)
                 if (
                     run is None
                     or run["status"] != "running"
@@ -545,7 +653,7 @@ class Store:
                 raise
 
     def fail_run(self, run_id: str, error: str) -> bool:
-        with self._lock:
+        with self._wlock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
@@ -568,7 +676,15 @@ class Store:
                 raise
 
     def cancel_run(self, run_id: str, reason: str) -> bool:
-        with self._lock:
+        """Persist a cancellation; the tombstone is set before any DB write.
+
+        Raises :class:`sqlite3.OperationalError` when the write lock is
+        held by another connection — the tombstone still bars the round
+        from writing or publishing, and the caller retries the
+        finalisation in the background until it lands.
+        """
+        self.mark_cancelled(run_id)
+        with self._wlock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
@@ -592,8 +708,8 @@ class Store:
 
     # --------------------------------------------------------------- published
     def published_state(self) -> dict[str, Any]:
-        with self._lock:
-            row = self._conn.execute(
+        with self._rlock:
+            row = self._read.execute(
                 "SELECT * FROM published_state WHERE id = 1"
             ).fetchone()
             result = dict(row) if row else {
@@ -602,7 +718,7 @@ class Store:
                 "success_count": 0,
                 "last_run_id": None,
             }
-            count = self._conn.execute(
+            count = self._read.execute(
                 "SELECT COUNT(*) AS n FROM catalog"
             ).fetchone()
             result["catalog_size"] = int(count["n"])
@@ -623,15 +739,15 @@ class Store:
                 "OR COALESCE(creator, '') LIKE ?"
             )
             params = [like, like, like]
-        with self._lock:
-            total = self._conn.execute(
+        with self._rlock:
+            total = self._read.execute(
                 f"SELECT COUNT(*) AS n FROM catalog {where}", params
             ).fetchone()["n"]
             total = int(total)
             pages = max(1, (total + page_size - 1) // page_size)
             if page > pages:
                 page = pages
-            rows = self._conn.execute(
+            rows = self._read.execute(
                 f"""
                 SELECT identifier, title, creator, source_datestamp,
                        harvested_at
@@ -651,5 +767,7 @@ class Store:
             }
 
     def close(self) -> None:
-        with self._lock:
+        with self._wlock:
             self._conn.close()
+        with self._rlock:
+            self._read.close()

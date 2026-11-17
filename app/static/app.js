@@ -20,6 +20,15 @@
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
     }[c]));
 
+  const phaseNames = {
+    connecting: "连接源端",
+    fetching: "取数中",
+    retrying: "分页重取中",
+    committing: "提交中",
+    cancelling: "取消收尾中",
+    finalizing: "收尾落库中",
+  };
+
   function render(status) {
     const active = status.active;
     if (!active) {
@@ -34,11 +43,17 @@
     const total = active.complete_list_size;
     const pct = total ? Math.min(100, Math.round((active.records_seen / total) * 100)) : null;
     const attemptsLeft = Math.max(0, (status.config.max_attempts || 3) - (active.attempt || 1));
+    const phase = phaseNames[active.phase] || active.phase || "—";
+    const pendingNote = active.cancel_pending
+      ? '<div class="row"><span>提示</span><span>取消已受理：在途写入与发布已被禁止，等暂存清理并落库后本轮才算取消完成（可能在等外部写锁释放）。</span></div>'
+      : active.finalize_pending
+        ? '<div class="row"><span>提示</span><span>轮次已结束，最终状态正在写入数据库（可能在等外部写锁释放），落库后才能开始新轮次。</span></div>'
+        : "";
     area.innerHTML = `
       <div class="progress">
         <div class="bar"><i style="width:${pct === null ? 15 : pct}%"></i></div>
         <div class="row"><span>状态</span><strong class="badge ${esc(active.status)}">${esc(active.status)}</strong></div>
-        <div class="row"><span>阶段</span><strong>${esc(active.phase || "—")}</strong></div>
+        <div class="row"><span>阶段</span><strong>${esc(phase)}</strong></div>
         <div class="row"><span>时间窗</span><span class="mono">${esc(active.window_from || "全量")} .. ${esc(active.window_until || "待定（读取源端时刻）")}</span></div>
         <div class="row"><span>已取页数</span><strong>${pages}</strong></div>
         <div class="row"><span>已取记录</span><strong>${active.records_seen}${total ? " / " + total : ""}</strong></div>
@@ -46,6 +61,7 @@
         <div class="row"><span>当前尝试</span><strong>${active.attempt || 1}（剩余重试 ${attemptsLeft}）</strong></div>
         <div class="row"><span>已暂存唯一标识</span><strong>${active.staged_count ?? 0}</strong></div>
         ${active.last_error ? `<div class="row"><span>最近错误</span><span>${esc(active.last_error)}</span></div>` : ""}
+        ${pendingNote}
       </div>`;
     startBtn.disabled = true;
     cancelBtn.disabled = false;

@@ -49,15 +49,31 @@ docker compose up --build
   - 进程崩溃：下次启动时 `Store` 把所有残留的 `running` 轮次标记为失败并清空暂存，
     同时发布状态完全不动。
 
-### 取消：不等待慢页
-- `POST /api/harvest/cancel`：先在 SQLite 里把该轮置为 `cancelled` 并清空暂存（本地事务，
-  毫秒级），再 `task.cancel()` 让正在等待的 HTTP 读取立刻放弃——**不等待慢页返回**。
-- `POST /api/harvest/restart`（网页上的“取消并立即重开”）：完成上述取消后立即创建
-  带新 `run_id` 的新轮次，无需等旧任务退出。
+### 取消：不等待慢页，也不等待外部写锁
+- `POST /api/harvest/cancel`：先在内存里给该轮立”取消墓碑”（tombstone）并取消
+  asyncio 任务——**从这一刻起该轮不能再取数、暂存或发布**，在途写入立即停止；
+  随后尽力把 `cancelled` 写入 SQLite（本地事务，毫秒级）。
+- 若另一 SQLite 连接正持有写锁，落库会快速失败（`busy_timeout` 默认 250ms，
+  **不延长等待**），接口立即返回 `{“status”: “cancelling”}`；后台收尾任务每隔
+  ~250ms 重试，**锁释放后自动完成**：清空暂存、状态落库，此后才视为取消完成
+  （状态接口的 `phase` 从 `cancelling` 变为 `cancelled`）。无需重启进程即可重采。
+- 锁错误以外的写入错误不重试、不吞掉：记录日志并留给下次启动时的恢复流程。
+- `POST /api/harvest/restart`（网页上的”取消并立即重开”）：无锁时取消落库是即时的，
+  新轮次立刻开始；有外部写锁时会短暂等待旧轮收尾落库（默认最多 5 秒，
+  `HARVEST_RESTART_WAIT_SECONDS`），等不到则返回 409 提示稍候重试。
 - 旧轮即便迟到：所有写入都以 `run_id` 为键；提交事务会再次校验
-  `active_run_id == run_id` 且状态仍为 `running`，否则直接 `ROLLBACK` 拒绝发布，
-  更不会触碰新轮次的状态/进度。
+  `active_run_id == run_id`、状态仍为 `running` 且没有取消墓碑，否则直接
+  `ROLLBACK` 拒绝发布，更不会触碰新轮次的状态/进度。
 - 数据库层还有 `WHERE status='running'` 的唯一索引，跨进程也最多一个活动轮次。
+
+### 外部写锁下的可用性
+- 采集器用**两条 SQLite 连接**：写连接串行所有变更；目录、进度、轮次查询走
+  独立的只读连接。WAL 模式下读者不等待写者，因此另一连接持有写锁时，
+  网页的目录浏览、进度轮询和取消受理都不被拖住。
+- 写连接的 `busy_timeout` 默认 250ms（`SQLITE_BUSY_TIMEOUT_MS`）：外部写锁让
+  写入**快速失败并如实报错**，由后台收尾重试兜住，而不是把事件循环卡住数秒。
+- 后台采集任务的写入若撞上外部写锁，本轮失败并记录 `database is locked`；
+  失败收尾同样由后台任务重试到落库为止，之后即可重采。
 
 ### 进度可见性
 - 网页每秒轮询 `/api/status`：阶段、时间窗、已取页数、已取记录 / `completeListSize`、
@@ -83,6 +99,8 @@ docker compose up --build
 | `OAI_READ_TIMEOUT` | `20` | 单页读取超时（秒） |
 | `HARVEST_MAX_ATTEMPTS` | `3` | 令牌失效后最多重取次数 |
 | `HARVEST_RETRY_BACKOFF_MS` | `300` | 重取前等待 |
+| `SQLITE_BUSY_TIMEOUT_MS` | `250` | 写连接遇外部写锁的等待上限（超时快速失败，后台收尾重试） |
+| `HARVEST_RESTART_WAIT_SECONDS` | `5` | "取消并立即重开"等待旧轮收尾落库的上限 |
 | `DEMO_PAGE_SIZE` | `3` | 演示源初始分页大小 |
 | `APP_PORT` / `DEMO_OAI_PORT` | `8000` / `8001` | 宿主机端口 |
 
